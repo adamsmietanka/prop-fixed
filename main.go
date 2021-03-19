@@ -1,0 +1,228 @@
+package main
+
+import (
+	"context"
+	"encoding/csv"
+	"encoding/json"
+	"fmt"
+	"log"
+	"math"
+	"net/http"
+	"os"
+	"strconv"
+
+	"github.com/aws/aws-lambda-go/events"
+	"github.com/aws/aws-lambda-go/lambda"
+)
+
+type props struct {
+	MaxSpeed float64 `json:"max_speed"`
+	StepSize float64 `json:"step_size"`
+	PropSpeed float64 `json:"prop_speed"`
+	Diameter float64 `json:"diameter"`
+	Blades int `json:"blades"`
+	Cp float64 `json:"cp"`
+	Power float64 `json:"power"`
+	Ratio float64 `json:"ratio"`
+	Angle float64 `json:"angle"`
+}
+
+type tableRow struct {
+	V, J, Cp, Rpm, Angle, Eff, Power float64
+}
+
+type charts struct {
+	Cp []interface{} `json:"cp"`
+	Eff []interface{} `json:"eff"`
+}
+
+type surfaceChart struct {
+	Colorscale [][]interface{} `json:"colorscale"`
+	Hovertemplate string `json:"hovertemplate"`
+	Opacity float64 `json:"opacity"`
+	Showscale bool `json:"showscale"`
+	Type string `json:"type"`
+	X []float64 `json:"x"`
+	Y []float64 `json:"y"`
+	Z [][]float64 `json:"z"`
+}
+
+type scatterChart struct {
+	Marker marker `json:"marker"`
+	Hovertemplate string `json:"hovertemplate"`
+	Line line `json:"line"`
+	Opacity float64 `json:"opacity"`
+	Type string `json:"type"`
+	X []float64 `json:"x"`
+	Y []float64 `json:"y"`
+	Z []float64 `json:"z"`
+}
+
+type marker struct {
+	Color []string `json:"color"`
+	Size float64 `json:"size"`
+}
+
+type line struct {
+	Color string `json:"color"`
+}
+
+func readCsvFile(filePath string) [][]float64 {
+    f, err := os.Open(filePath)
+    if err != nil {
+        log.Fatal("Unable to read input file " + filePath, err)
+    }
+    defer f.Close()
+
+    csvReader := csv.NewReader(f)
+    records, err := csvReader.ReadAll()
+    if err != nil {
+        log.Fatal("Unable to parse file as CSV for " + filePath, err)
+    }
+	values, _ := convertToFloat(records)
+
+    return values
+}
+
+func convertToFloat(records [][]string) ([][]float64, error) {
+    values := make([][]float64, len(records))
+    for i := range values {
+        values[i] = make([]float64, len(records[i]))
+    }
+    for i := range records {
+        for j := range records[i] {
+			if records[i][j] != "" {
+				val, err := strconv.ParseFloat(records[i][j], 64)
+				values[i][j] = val
+				if err != nil {
+					log.Fatal("Unable to convert array to float", err)
+				}
+			}
+		}
+	}
+	return values, nil
+}
+
+func loadData(p props) ([][]float64, [][]float64) {
+	cpY := make([]float64, 51)
+	effY := make([]float64, 101)
+	for i := range cpY {
+		cpY[i] = 10 + float64(i)
+	}
+	for i := range effY {
+		effY[i] = 10 + 0.5 * float64(i)
+	}
+	cpFile := fmt.Sprintf("data/clark_%d_cp.csv", p.Blades)
+	effFile := fmt.Sprintf("data/clark_%d_eff.csv", p.Blades)
+	cp := readCsvFile(cpFile)
+	eff := readCsvFile(effFile)
+    return append(cp, cpY), append(eff, effY) 
+}
+
+func prepare(p props, cp [][]float64) []float64 {
+	j_lim := BarycentricX(cp[0], cp[len(cp) - 1], cp[1:len(cp) - 1], p.Angle, p.Cp)
+	j_end := BarycentricX(cp[0], cp[len(cp) - 1], cp[1:len(cp) - 1], p.Angle, 0)
+	points := make([]float64, 0)
+	for i := 0; i < 10; i++ {
+		points = append(points, float64(i) * j_lim / 10)
+	}
+	for i := 0; i < 6; i++ {  
+		points = append(points, j_lim + float64(i) * (j_end - j_lim) / 5)
+	}
+	return points
+}
+
+func table(p props, cp, eff [][]float64) []tableRow {
+	points := prepare(p, cp)
+	table := make([]tableRow, len(points))
+	for i := range table {
+		j := points[i]
+		CP :=  BarycentricZ(cp[0], cp[len(cp) - 1], cp[1:len(cp) - 1], j, p.Angle)
+		eff := BarycentricZ(eff[0], eff[len(eff) - 1], eff[1:len(eff) - 1], j, p.Angle)
+		n := math.Sqrt(p.Cp * p.PropSpeed * p.PropSpeed / CP)
+		// engine max speed cannot be surpassed
+		if i >= 10 {
+			n = p.PropSpeed
+		}
+		power := p.Power * eff * n / p.PropSpeed
+		v := j * n * p.Diameter
+		rpm := n * 60 / p.Ratio
+		table[i] = tableRow{v, j, CP, rpm, p.Angle, eff, power}
+	}
+	return table
+}
+
+func getCharts(p props, table []tableRow, cp, eff [][]float64) ([]interface{}, []interface{}) {
+	J, Angle := make([]float64, len(table)), make([]float64, len(table))
+	Cp, Eff := make([]float64, len(table)), make([]float64, len(table))
+	color := make([]string, len(table))
+	for i, v := range table {
+		J[i], Angle[i] = v.J, v.Angle
+		Cp[i], Eff[i] = v.Cp, v.Eff
+		color[i] = "#0275d8"
+		if i >= 10 {
+			color[i] = "#c00"
+		}
+	}
+	colorscale := [][]interface{}{{0, "rgb(23, 55, 35)"}, {0.5, "rgb(37, 157, 81)"}, {1, "rgb(186, 228, 174)"}}
+	opacity := 0.9
+	hoverCp := "<b>J</b>: %{x}<br><b>Angle</b>: %{y}°<br><b>Cp</b>: %{z}<extra></extra>"
+	hoverEff := "<b>J</b>: %{x}<br><b>Angle</b>: %{y}°<br><b>Eff</b>: %{z}<extra></extra>"
+	show := false
+	chartCp := []interface{}{
+		surfaceChart{
+			colorscale, hoverCp, opacity, show, "surface", cp[0], cp[len(cp) - 1], cp[1:len(cp) - 1],
+		},
+		scatterChart{
+			marker{color, 6}, hoverCp, line{"#0275d8"}, opacity, "scatter3d", J, Angle, Cp,
+		},
+	}
+	chartEff := []interface{}{
+		surfaceChart{
+			colorscale, hoverEff, opacity, show, "surface", eff[0], eff[len(eff) - 1], eff[1:len(eff) - 1],
+		},
+		scatterChart{
+			marker{color, 6}, hoverEff, line{"#0275d8"}, opacity, "scatter3d", J, Angle, Eff,
+		},
+	}
+	return chartCp, chartEff
+}
+
+func getProps (request events.APIGatewayProxyRequest) props {
+	maxSpeed, _ := strconv.ParseFloat(request.QueryStringParameters["max_speed"], 64)
+	stepSize, _ := strconv.ParseFloat(request.QueryStringParameters["step_size"], 64)
+	propSpeed, _ := strconv.ParseFloat(request.QueryStringParameters["prop_speed"], 64)
+	diameter, _ := strconv.ParseFloat(request.QueryStringParameters["diameter"], 64)
+	blades, _ := strconv.Atoi(request.QueryStringParameters["blades"])
+	Cp, _ := strconv.ParseFloat(request.QueryStringParameters["cp"], 64)
+	power, _ := strconv.ParseFloat(request.QueryStringParameters["power"], 64)
+	ratio, _ := strconv.ParseFloat(request.QueryStringParameters["ratio"], 64)
+	angle, _ := strconv.ParseFloat(request.QueryStringParameters["angle"], 64)
+	return props{maxSpeed, stepSize, propSpeed, diameter, blades, Cp, power, ratio, angle}
+}
+
+func handle(ctx context.Context, request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
+	p := getProps(request)
+    cp, eff := loadData(p)
+	table := table(p, cp, eff)
+	chartCp, chartEff := getCharts(p, table, cp, eff)
+	body := struct{
+		Table []tableRow `json:"table"`
+		Charts charts `json:"charts"`
+	}{
+		table,
+		charts{
+			chartCp,
+			chartEff,
+		},
+	}
+	js, _ := json.Marshal(body)
+    return events.APIGatewayProxyResponse{
+        StatusCode: http.StatusOK,
+        Body:       string(js),
+    }, nil
+}
+
+func main() {
+        lambda.Start(handle)
+}
