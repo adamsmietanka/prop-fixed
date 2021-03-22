@@ -31,3 +31,6 @@ The interpolation functions lie in a file outside ```main.go``` called ```interp
 ## Impact
 The serverless approach replaced the original Flask backend and helped speed up the calculation process almost 40x times.
 It also reduced the cost to close to nothing as there is no server nor database left to maintain.
+
+## See also
+* [prop-variable](https://github.com/adamsmietanka/prop-variable) - Lambda funtion used to calculate efficiency of variable pitch propellers
